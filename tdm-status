@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+Twitch Drops Miner - CLI Status & Claim History Dashboard
+支持自动探测单账号/多账号服务、实时大盘展示、东八区时间换算与掉宝历史查看。
+"""
+import os
+import re
+import sys
+import time
+import json
+import argparse
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+# 东八区时区 (UTC+8)
+CST = timezone(timedelta(hours=8))
+
+# 默认自动探测候选目录
+SEARCH_PATHS = [
+    Path.home() / "services",
+    Path("/opt"),
+    Path("/srv"),
+    Path.cwd(),
+]
+
+def make_bar(percent: float, length: int = 24) -> str:
+    filled = int(round(length * percent / 100))
+    filled = max(0, min(length, filled))
+    return "█" * filled + "░" * (length - filled)
+
+def parse_iso_to_cst(iso_str: str) -> tuple[datetime | None, str]:
+    if not iso_str:
+        return None, ""
+    try:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z?([+-]\d{2}:?\d{2})?$", str(iso_str))
+        if m:
+            date_part, time_part, frac, tz_part = m.groups()
+            dt_base = datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M:%S")
+            dt_utc = dt_base.replace(tzinfo=timezone.utc)
+            dt_cst = dt_utc.astimezone(CST)
+            return dt_cst, dt_cst.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            dt_cst = datetime.strptime(str(iso_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST)
+            return dt_cst, dt_cst.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return None, str(iso_str)
+
+def calc_time_ago(raw_time: str) -> str:
+    if not raw_time:
+        return ""
+    dt_cst, _ = parse_iso_to_cst(raw_time)
+    if not dt_cst:
+        return ""
+    now_cst = datetime.now(CST)
+    diff = now_cst - dt_cst
+    seconds = int(diff.total_seconds())
+    if seconds < 0:
+        return "刚刚"
+    if seconds < 60:
+        return f"{seconds}秒前"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}分钟前"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}小时前"
+    days = hours // 24
+    return f"{days}天前"
+
+def is_service_running(unit_name: str) -> bool:
+    if not unit_name:
+        return False
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["systemctl", "is-active", unit_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        return res.stdout.strip() == "active"
+    except Exception:
+        return False
+
+def discover_accounts(custom_dirs: list[str] = None) -> list[dict]:
+    found = []
+    seen_dirs = set()
+
+    if custom_dirs:
+        candidates = [Path(d).expanduser().resolve() for d in custom_dirs]
+    else:
+        candidates = []
+        # 当前目录如果存在 status.json 或 main.py
+        if (Path.cwd() / "status.json").exists() or (Path.cwd() / "main.py").exists():
+            candidates.append(Path.cwd())
+        # 扫描搜索路径下的子目录
+        for base in SEARCH_PATHS:
+            if base.exists() and base.is_dir():
+                for sub in base.glob("*twitch*drops*"):
+                    if sub.is_dir():
+                        candidates.append(sub)
+
+    for p in candidates:
+        if not p.exists() or p in seen_dirs:
+            continue
+        seen_dirs.add(p)
+        status_file = p / "status.json"
+        main_file = p / "main.py"
+        if status_file.exists() or main_file.exists():
+            # 推测 service 名字
+            svc_name = ""
+            candidates_svc = [
+                f"tdm-{p.name}",
+                p.name,
+            ]
+            if "acc2" in p.name or "acc-2" in p.name:
+                candidates_svc.extend(["tdm-acc2", "tdm@acc2"])
+            elif "acc1" in p.name or "acc-1" in p.name or p.name == "twitch-drops-miner":
+                candidates_svc.extend(["tdm-acc1", "tdm@acc1", "tdm", "twitch-drops-miner"])
+            
+            for s in candidates_svc:
+                if s and is_service_running(s):
+                    svc_name = s
+                    break
+            found.append({
+                "id": p.name,
+                "name": p.name,
+                "service": svc_name,
+                "dir": p,
+            })
+
+    found.sort(key=lambda x: x["name"])
+    return found
+
+def get_account_status(acc_info: dict) -> dict:
+    status_file = acc_info["dir"] / "status.json"
+    is_active = is_service_running(acc_info.get("service", ""))
+    data = {
+        "id": acc_info["id"],
+        "name": acc_info["name"],
+        "service": acc_info.get("service") or "-",
+        "running": is_active,
+        "updated_at": "-",
+        "status_text": "未运行" if not is_active and acc_info.get("service") else "待命 / 准备中...",
+        "tracked_games": [],
+        "priority_mode": "",
+        "watching": None,
+        "drop": None,
+        "latest_claim": None,
+        "recent_claims": [],
+    }
+    if status_file.exists():
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                content = json.load(f)
+                data["updated_at"] = content.get("updated_at", "-")
+                if content.get("status_text"):
+                    data["status_text"] = content["status_text"]
+                data["watching"] = content.get("watching")
+                data["drop"] = content.get("drop")
+                data["tracked_games"] = content.get("tracked_games", [])
+                data["priority_mode"] = content.get("priority_mode", "")
+                data["latest_claim"] = content.get("latest_claim")
+                data["recent_claims"] = content.get("recent_claims", [])
+                if not is_active and content.get("pid"):
+                    # 检查进程是否还活着
+                    try:
+                        os.kill(content["pid"], 0)
+                        data["running"] = True
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+    return data
+
+def format_claim_entry(item: dict) -> tuple[str, str, str]:
+    gname = item.get("game") or "未识别游戏"
+    name = item.get("name", "未知奖励")
+    count = item.get("total_count", 1)
+    count_str = f" (累计已领 {count} 次)" if count > 0 else ""
+    full_name = f"[{gname}] {name}{count_str}"
+
+    raw_t = item.get("raw_time") or item.get("awarded_at", "")
+    _, cst_time_str = parse_iso_to_cst(raw_t)
+    ago = calc_time_ago(raw_t)
+    ago_str = f" ({ago})" if ago else ""
+    time_display = f"{cst_time_str}{ago_str}" if cst_time_str else "-"
+
+    return gname, full_name, time_display
+
+def render_cli(statuses: list[dict], show_history: bool = False):
+    sep = "─" * 74
+    lines = []
+    lines.append(f"┌{sep}┐")
+    current_time_str = datetime.now(CST).strftime("%H:%M:%S")
+    title = f" Twitch Drops Miner 挂机与掉宝总览 (北京时间 {current_time_str}) "
+    lines.append(f"│{title.center(70)}│")
+    lines.append(f"├{sep}┤")
+
+    if not statuses:
+        lines.append("│ 未找到运行中的 Twitch Drops Miner 实例。".ljust(72) + "│")
+        lines.append(f"└{sep}┘")
+        return "\n".join(lines)
+
+    for i, s in enumerate(statuses):
+        run_badge = "🟢 运行中" if s["running"] else "🔴 已停止"
+        svc_display = f" [{s['service']}]" if s['service'] != "-" else ""
+        lines.append(f"│ 👤 {s['name']}{svc_display}  {run_badge}")
+        lines.append(f"│   状态: {s['status_text']}")
+
+        games = s.get("tracked_games") or []
+        games_str = ", ".join(games) if games else "未配置(全部游戏)"
+        mode_str = s.get("priority_mode") or "默认模式"
+        lines.append(f"│   🎯 跟踪游戏: {games_str}")
+        lines.append(f"│   ⚙️ 挂机模式: {mode_str}")
+
+        watching = s.get("watching")
+        if watching:
+            viewers_str = f" ({watching['viewers']:,} 观众)" if watching.get("viewers") else ""
+            lines.append(f"│   📺 当前直播: {watching['name']}{viewers_str}")
+
+        drop = s.get("drop")
+        if drop and drop.get("game"):
+            pct = drop.get("progress_percent", 0.0)
+            cur = drop.get("current_minutes", 0)
+            req = drop.get("required_minutes", 0)
+            rem = drop.get("remaining_minutes", 0)
+            bar = make_bar(pct, 20)
+            lines.append(f"│   🎮 目标游戏: {drop.get('game')} | 活动: {drop.get('campaign', '-')}")
+            lines.append(f"│   🎁 目标奖励: {drop.get('rewards', '-')}")
+            lines.append(f"│   ⏳ 当前进度: [{bar}] {pct:.1f}% ({cur}/{req} 分钟, 剩 {rem} 分钟)")
+        elif s["running"]:
+            lines.append(f"│   ⏳ 当前进度: (当前无正在观看的掉落活动)")
+
+        latest = s.get("latest_claim")
+        if latest and latest.get("name"):
+            _, full_name, time_display = format_claim_entry(latest)
+            lines.append(f"│   🏆 最近领取: {full_name}")
+            lines.append(f"│      领取时间: {time_display}")
+        else:
+            lines.append(f"│   🏆 最近领取: (暂无记录/尚未同步)")
+
+        if show_history and s.get("recent_claims"):
+            lines.append(f"│   📜 历史掉宝明细 (最近5条, 北京时间):")
+            for item in s["recent_claims"]:
+                _, full_name, time_display = format_claim_entry(item)
+                lines.append(f"│      • [{time_display}] {full_name}")
+
+        lines.append(f"│   ⏱️ 状态同步: {s['updated_at']} (UTC+8)")
+
+        if i < len(statuses) - 1:
+            lines.append(f"├{sep}┤")
+
+    lines.append(f"└{sep}┘")
+    return "\n".join(lines)
+
+def main():
+    parser = argparse.ArgumentParser(description="Twitch Drops Miner 实时进度与掉宝记录查看器")
+    parser.add_argument("-w", "--watch", action="store_true", help="实时动态刷新监控 (每 2 秒)")
+    parser.add_argument("-c", "--claims", action="store_true", help="展开最近所有领取的历史掉宝明细")
+    parser.add_argument("-j", "--json", action="store_true", help="以 JSON 格式输出")
+    parser.add_argument("-d", "--dir", action="append", help="手动指定实例根目录路径 (可重复传入多个)")
+    args = parser.parse_args()
+
+    accounts = discover_accounts(args.dir)
+
+    if args.json:
+        results = [get_account_status(a) for a in accounts]
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        return
+
+    if args.watch:
+        try:
+            while True:
+                results = [get_account_status(a) for a in accounts]
+                output = render_cli(results, show_history=args.claims)
+                sys.stdout.write("\033[2J\033[H" + output + "\n按 Ctrl+C 退出监控...\n")
+                sys.stdout.flush()
+                time.sleep(2)
+        except KeyboardInterrupt:
+            print("\n已退出。")
+            return
+    else:
+        results = [get_account_status(a) for a in accounts]
+        print(render_cli(results, show_history=args.claims))
+
+if __name__ == "__main__":
+    main()

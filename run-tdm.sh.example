@@ -1,0 +1,18 @@
+#!/bin/bash
+# Twitch Drops Miner —— Headless 启动包装脚本
+set -u
+cd "$(dirname "$0")" || exit 1
+
+export PYTHONUNBUFFERED=1
+export NO_AT_BRIDGE=1
+export LANG=zh_CN.UTF-8
+export DISPLAY=:99
+
+# 使用当前目录下的虚拟环境（或系统 Python）启动 headless_run.py
+if [ -f "./.venv/bin/python" ]; then
+    exec ./.venv/bin/python headless_run.py --log
+elif [ -f "./env/bin/python" ]; then
+    exec ./env/bin/python headless_run.py --log
+else
+    exec python3 headless_run.py --log
+fi

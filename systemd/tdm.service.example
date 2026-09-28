@@ -1,0 +1,22 @@
+[Unit]
+Description=Twitch Drops Miner (Headless Optimized)
+Documentation=https://github.com/DevilXD/TwitchDropsMiner
+After=network-online.target xvfb-tdm.service
+Wants=network-online.target xvfb-tdm.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/path/to/twitch-drops-miner
+ExecStart=/path/to/twitch-drops-miner/run-tdm.sh
+Restart=always
+RestartSec=30
+TimeoutStopSec=20
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tdm
+
+[Install]
+WantedBy=multi-user.target
