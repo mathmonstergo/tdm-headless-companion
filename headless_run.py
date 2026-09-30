@@ -64,16 +64,93 @@ async def _fake_add_campaign(self, campaign):
 gui.InventoryOverview.add_campaign = _fake_add_campaign
 
 # 3. 掉宝历史捕获与格式化
+BENEFIT_CACHE_FILE = Path("benefit_cache.json")
+_benefit_cache: dict[str, dict] = {}
+if BENEFIT_CACHE_FILE.exists():
+    try:
+        with open(BENEFIT_CACHE_FILE, "r", encoding="utf-8") as f:
+            _benefit_cache = json.load(f)
+    except Exception:
+        pass
+
+def _save_benefit_cache():
+    try:
+        tmp = BENEFIT_CACHE_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_benefit_cache, f, ensure_ascii=False, indent=2)
+        tmp.replace(BENEFIT_CACHE_FILE)
+    except Exception:
+        pass
+
+def _record_campaign_drops(camp: dict):
+    if not isinstance(camp, dict):
+        return False
+    gname = None
+    g = camp.get("game")
+    if isinstance(g, dict):
+        gname = g.get("displayName") or g.get("name")
+    cname = camp.get("name")
+    updated = False
+    for d in camp.get("timeBasedDrops") or []:
+        req_min = d.get("requiredMinutesWatched")
+        dname = d.get("name")
+        for b_edge in d.get("benefitEdges") or []:
+            b = b_edge.get("benefit")
+            if isinstance(b, dict):
+                bid = b.get("id")
+                bname = b.get("name")
+                if bid:
+                    old_entry = _benefit_cache.get(bid) or {}
+                    new_entry = {
+                        "game": gname or old_entry.get("game"),
+                        "name": bname or dname or old_entry.get("name"),
+                        "required_minutes": req_min if req_min is not None else old_entry.get("required_minutes"),
+                        "campaign": cname or old_entry.get("campaign"),
+                    }
+                    if new_entry != old_entry:
+                        _benefit_cache[bid] = new_entry
+                        updated = True
+    if updated:
+        _save_benefit_cache()
+    return updated
+
 _cached_claims_info = {}
 
-def _infer_game_name(event: dict, benefit_map: dict, priority_games: list[str]) -> str:
+def _enrich_cached_claims() -> bool:
+    updated = False
+    claims_to_check = []
+    lat = _cached_claims_info.get("latest_claim")
+    if lat and isinstance(lat, dict):
+        claims_to_check.append(lat)
+    for c in _cached_claims_info.get("recent_claims") or []:
+        if c and isinstance(c, dict):
+            claims_to_check.append(c)
+
+    for item in claims_to_check:
+        if item.get("required_minutes") is None:
+            eid = item.get("id")
+            req = None
+            if eid and eid in _benefit_cache:
+                req = _benefit_cache[eid].get("required_minutes")
+            if req is None:
+                cname = item.get("name")
+                for b_info in _benefit_cache.values():
+                    if b_info.get("name") == cname and b_info.get("required_minutes") is not None:
+                        req = b_info.get("required_minutes")
+                        break
+            if req is not None:
+                item["required_minutes"] = req
+                updated = True
+    return updated
+
+def _infer_game_name(event: dict, priority_games: list[str]) -> str:
     eid = event.get("id", "")
     ename = event.get("name", "")
     link = event.get("requiredAccountLink", "")
 
     # 1. 优先从活动 benefit 字典精确命中
-    if eid in benefit_map:
-        return benefit_map[eid]
+    if eid in _benefit_cache and _benefit_cache[eid].get("game"):
+        return _benefit_cache[eid]["game"]
 
     # 2. 智能特征推导
     low_link = link.lower()
@@ -100,17 +177,8 @@ def _parse_game_events(game_events: list, ongoing_camps: list, priority_games: l
     if not game_events:
         return None, []
 
-    # 建立 benefit_id -> game_name 字典
-    b_map = {}
     for camp in ongoing_camps:
-        gname = camp.get("game", {}).get("name") if camp.get("game") else None
-        if not gname:
-            continue
-        for d in camp.get("timeBasedDrops") or []:
-            for b_edge in d.get("benefitEdges") or []:
-                bid = b_edge.get("benefit", {}).get("id")
-                if bid:
-                    b_map[bid] = gname
+        _record_campaign_drops(camp)
 
     sorted_events = sorted(
         [e for e in game_events if e.get("lastAwardedAt")],
@@ -124,47 +192,86 @@ def _parse_game_events(game_events: list, ongoing_camps: list, priority_games: l
     for it in sorted_events[:5]:
         raw_t = it.get("lastAwardedAt", "")
         _, cst_str = parse_iso_to_cst(raw_t)
-        gname = _infer_game_name(it, b_map, priority_games)
+        eid = it.get("id", "")
+        cached = _benefit_cache.get(eid) or {}
+        gname = cached.get("game") or _infer_game_name(it, priority_games)
+        req_min = cached.get("required_minutes")
+        if req_min is None:
+            cname = it.get("name")
+            for b_info in _benefit_cache.values():
+                if b_info.get("name") == cname and b_info.get("required_minutes") is not None:
+                    req_min = b_info.get("required_minutes")
+                    break
+
         recent_list.append({
+            "id": eid,
             "game": gname,
             "name": it.get("name", "未知奖励"),
             "awarded_at": cst_str,
             "raw_time": raw_t,
-            "total_count": it.get("totalCount", 1)
+            "total_count": it.get("totalCount", 1),
+            "required_minutes": req_min,
         })
 
     latest_item = sorted_events[0]
     raw_latest_t = latest_item.get("lastAwardedAt", "")
     _, latest_cst_str = parse_iso_to_cst(raw_latest_t)
-    latest_gname = _infer_game_name(latest_item, b_map, priority_games)
+    latest_eid = latest_item.get("id", "")
+    latest_cached = _benefit_cache.get(latest_eid) or {}
+    latest_gname = latest_cached.get("game") or _infer_game_name(latest_item, priority_games)
+    latest_req_min = latest_cached.get("required_minutes")
+    if latest_req_min is None:
+        latest_cname = latest_item.get("name")
+        for b_info in _benefit_cache.values():
+            if b_info.get("name") == latest_cname and b_info.get("required_minutes") is not None:
+                latest_req_min = b_info.get("required_minutes")
+                break
 
     latest_claim = {
+        "id": latest_eid,
         "game": latest_gname,
         "name": latest_item.get("name", "未知奖励"),
         "awarded_at": latest_cst_str,
         "raw_time": raw_latest_t,
-        "total_count": latest_item.get("totalCount", 1)
+        "total_count": latest_item.get("totalCount", 1),
+        "required_minutes": latest_req_min,
     }
     return latest_claim, recent_list
 
-# Hook gql_request 捕获 Inventory 数据
+# Hook gql_request 捕获 Inventory 与 Campaign 数据
 _orig_gql_request = twitch.Twitch.gql_request
 async def _hooked_gql_request(self, operations):
     result = await _orig_gql_request(self, operations)
     try:
         res_list = [result] if isinstance(result, dict) else (result if isinstance(result, list) else [])
         for item in res_list:
-            if isinstance(item, dict) and "data" in item:
-                user = item["data"].get("currentUser")
-                if user and isinstance(user, dict) and "inventory" in user:
-                    inv = user["inventory"]
-                    events = inv.get("gameEventDrops", [])
-                    ongoing = inv.get("dropCampaignsInProgress", []) or []
-                    p_games = list(getattr(self.settings, "priority", [])) if hasattr(self, "settings") else []
-                    if events:
-                        lat, rec = _parse_game_events(events, ongoing, p_games)
-                        _cached_claims_info["latest_claim"] = lat
-                        _cached_claims_info["recent_claims"] = rec
+            if not (isinstance(item, dict) and "data" in item):
+                continue
+            data = item["data"]
+            if not isinstance(data, dict):
+                continue
+
+            # 1. 捕获 Inventory 数据
+            user = data.get("currentUser")
+            if user and isinstance(user, dict) and "inventory" in user:
+                inv = user["inventory"]
+                events = inv.get("gameEventDrops", [])
+                ongoing = inv.get("dropCampaignsInProgress", []) or []
+                p_games = list(getattr(self.settings, "priority", [])) if hasattr(self, "settings") else []
+                if events:
+                    lat, rec = _parse_game_events(events, ongoing, p_games)
+                    _cached_claims_info["latest_claim"] = lat
+                    _cached_claims_info["recent_claims"] = rec
+                    if hasattr(self, "gui"):
+                        _write_status_file(self.gui)
+
+            # 2. 捕获 CampaignDetails 数据
+            u = data.get("user")
+            if u and isinstance(u, dict) and "dropCampaign" in u:
+                dc = u.get("dropCampaign")
+                if dc and isinstance(dc, dict):
+                    updated = _record_campaign_drops(dc)
+                    if updated and _enrich_cached_claims():
                         if hasattr(self, "gui"):
                             _write_status_file(self.gui)
     except Exception:
@@ -182,22 +289,33 @@ async def _hooked_base_drop_claim(self):
             now_str = now_cst_str()
             game_name = getattr(self.campaign.game, "name", "未知游戏")
             reward_name = self.rewards_text()
-            _cached_claims_info["latest_claim"] = {
+            req_min = getattr(self, "required_minutes", None)
+            claim_entry = {
+                "id": getattr(self, "id", ""),
                 "game": game_name,
                 "name": reward_name,
                 "awarded_at": now_str,
                 "raw_time": datetime.now(timezone.utc).isoformat(),
-                "total_count": 1
+                "total_count": 1,
+                "required_minutes": req_min,
             }
+            _cached_claims_info["latest_claim"] = claim_entry
             rec = _cached_claims_info.get("recent_claims", [])
-            rec.insert(0, {
-                "game": game_name,
-                "name": reward_name,
-                "awarded_at": now_str,
-                "raw_time": datetime.now(timezone.utc).isoformat(),
-                "total_count": 1
-            })
+            rec.insert(0, claim_entry)
             _cached_claims_info["recent_claims"] = rec[:5]
+
+            # 记录到 _benefit_cache
+            for b in getattr(self, "benefits", []) or []:
+                bid = getattr(b, "id", None)
+                if bid:
+                    _benefit_cache[bid] = {
+                        "game": game_name,
+                        "name": getattr(b, "name", reward_name),
+                        "required_minutes": req_min,
+                        "campaign": getattr(self.campaign, "name", ""),
+                    }
+            _save_benefit_cache()
+
             if hasattr(self, "_twitch") and hasattr(self._twitch, "gui"):
                 _write_status_file(self._twitch.gui)
         except Exception:
@@ -245,6 +363,26 @@ def _write_status_file(manager, drop=None, status_text=None, clear_drop=False):
                         status_data["tracked_games"] = old.get("tracked_games", [])
                     if not status_data["priority_mode"]:
                         status_data["priority_mode"] = old.get("priority_mode", "")
+
+                    # 尝试从旧记录与 _benefit_cache 中补全缺失的 required_minutes
+                    old_claims = {c.get("name"): c for c in old.get("recent_claims", []) if isinstance(c, dict)}
+                    for item in status_data.get("recent_claims", []):
+                        if item.get("required_minutes") is None:
+                            old_item = old_claims.get(item.get("name"))
+                            if old_item and old_item.get("required_minutes") is not None:
+                                item["required_minutes"] = old_item["required_minutes"]
+                            else:
+                                eid = item.get("id")
+                                if eid and eid in _benefit_cache:
+                                    item["required_minutes"] = _benefit_cache[eid].get("required_minutes")
+                    if status_data.get("latest_claim") and status_data["latest_claim"].get("required_minutes") is None:
+                        old_latest = old.get("latest_claim") or {}
+                        if old_latest.get("name") == status_data["latest_claim"].get("name") and old_latest.get("required_minutes") is not None:
+                            status_data["latest_claim"]["required_minutes"] = old_latest["required_minutes"]
+                        else:
+                            eid = status_data["latest_claim"].get("id")
+                            if eid and eid in _benefit_cache:
+                                status_data["latest_claim"]["required_minutes"] = _benefit_cache[eid].get("required_minutes")
             except Exception:
                 pass
 

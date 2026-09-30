@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+status.json
+benefit_cache.json

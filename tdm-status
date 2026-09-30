@@ -68,9 +68,9 @@ def calc_time_ago(raw_time: str) -> str:
     days = hours // 24
     return f"{days}天前"
 
-def is_service_running(unit_name: str) -> bool:
+def get_service_state(unit_name: str) -> str:
     if not unit_name:
-        return False
+        return ""
     try:
         import subprocess
         res = subprocess.run(
@@ -79,9 +79,12 @@ def is_service_running(unit_name: str) -> bool:
             stderr=subprocess.PIPE,
             text=True
         )
-        return res.stdout.strip() == "active"
+        return res.stdout.strip()
     except Exception:
-        return False
+        return ""
+
+def is_service_running(unit_name: str) -> bool:
+    return get_service_state(unit_name) == "active"
 
 def discover_accounts(custom_dirs: list[str] = None) -> list[dict]:
     found = []
@@ -133,22 +136,97 @@ def discover_accounts(custom_dirs: list[str] = None) -> list[dict]:
     found.sort(key=lambda x: x["name"])
     return found
 
+def format_duration(minutes: int | float | None) -> str:
+    if minutes is None:
+        return ""
+    try:
+        minutes = int(minutes)
+    except (ValueError, TypeError):
+        return ""
+    if minutes <= 0:
+        return ""
+    if minutes % 60 == 0:
+        return f"{minutes // 60}小时"
+    elif minutes > 60:
+        hours = minutes / 60
+        if round(hours, 1) == round(hours, 2):
+            return f"{round(hours, 1)}小时"
+        return f"{minutes // 60}小时{minutes % 60}分钟"
+    else:
+        return f"{minutes}分钟"
+
+def determine_status_badge(data: dict) -> tuple[str, str]:
+    """
+    状态体系判定:
+    - 🔴 服务异常: systemd 为 failed, 或含有严重错误文本
+    - ⚪ 已停止: 服务处于 inactive 且未运行
+    - 🟢 观看中: 正在观看直播频道、或正在推进掉落活动进度
+    - 🟡 待机中: 运行正常, 但当前无正在观看的掉落活动 (Idle / 已完成 / 等待中)
+    """
+    unit_state = data.get("unit_state", "")
+    is_running = data.get("running", False)
+    status_text = data.get("status_text", "")
+    watching = data.get("watching")
+    drop = data.get("drop")
+    low_text = status_text.lower()
+
+    # 1. 服务异常判定
+    if unit_state == "failed":
+        return "🔴 服务异常", "failed"
+    if any(k in low_text for k in ["error", "exception", "failed", "crash", "崩溃", "登录失败", "token expired"]):
+        return "🔴 服务异常", "failed"
+
+    # 2. 未运行/已停止判定
+    if not is_running:
+        return "⚪ 已停止", "stopped"
+
+    # 3. 观看中判定 (有正在观看的频道，或正在挖矿中)
+    is_watching = False
+    if watching and isinstance(watching, dict) and watching.get("name"):
+        is_watching = True
+    elif "watching" in low_text or "mining" in low_text or "观看" in low_text:
+        is_watching = True
+    elif drop and isinstance(drop, dict) and drop.get("game") and not drop.get("claimed", False):
+        if not any(k in low_text for k in ["idle", "完成", "待命", "准备"]):
+            is_watching = True
+
+    if is_watching:
+        return "🟢 观看中", "watching"
+
+    # 4. 其余正常运行状态均为待机中 (Idle, 已完成获取, 同步中, 准备中等)
+    return "🟡 待机中", "idle"
+
 def get_account_status(acc_info: dict) -> dict:
     status_file = acc_info["dir"] / "status.json"
-    is_active = is_service_running(acc_info.get("service", ""))
+    cache_file = acc_info["dir"] / "benefit_cache.json"
+    b_cache = {}
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as bf:
+                b_cache = json.load(bf)
+        except Exception:
+            pass
+
+    svc_name = acc_info.get("service") or ""
+    unit_state = get_service_state(svc_name) if svc_name else ""
+    is_active = (unit_state == "active")
+
     data = {
         "id": acc_info["id"],
         "name": acc_info["name"],
-        "service": acc_info.get("service") or "-",
+        "service": svc_name or "-",
+        "unit_state": unit_state or "-",
         "running": is_active,
         "updated_at": "-",
-        "status_text": "未运行" if not is_active and acc_info.get("service") else "待命 / 准备中...",
+        "status_text": "未运行" if not is_active and svc_name else "待命 / 准备中...",
         "tracked_games": [],
         "priority_mode": "",
         "watching": None,
         "drop": None,
         "latest_claim": None,
         "recent_claims": [],
+        "status_badge": "⚪ 已停止" if not is_active and svc_name else "🟡 待机中",
+        "status_type": "stopped" if not is_active and svc_name else "idle",
     }
     if status_file.exists():
         try:
@@ -163,6 +241,25 @@ def get_account_status(acc_info: dict) -> dict:
                 data["priority_mode"] = content.get("priority_mode", "")
                 data["latest_claim"] = content.get("latest_claim")
                 data["recent_claims"] = content.get("recent_claims", [])
+
+                # 补全缺失的时长
+                if b_cache:
+                    claims_to_check = []
+                    if data["latest_claim"]:
+                        claims_to_check.append(data["latest_claim"])
+                    claims_to_check.extend(data["recent_claims"] or [])
+                    for item in claims_to_check:
+                        if item.get("required_minutes") is None:
+                            eid = item.get("id")
+                            if eid and eid in b_cache and b_cache[eid].get("required_minutes") is not None:
+                                item["required_minutes"] = b_cache[eid]["required_minutes"]
+                            else:
+                                cname = item.get("name")
+                                for b_info in b_cache.values():
+                                    if b_info.get("name") == cname and b_info.get("required_minutes") is not None:
+                                        item["required_minutes"] = b_info.get("required_minutes")
+                                        break
+
                 if not is_active and content.get("pid"):
                     # 检查进程是否还活着
                     try:
@@ -172,14 +269,29 @@ def get_account_status(acc_info: dict) -> dict:
                         pass
         except Exception:
             pass
+
+    # 综合判定状态徽标
+    badge, stype = determine_status_badge(data)
+    data["status_badge"] = badge
+    data["status_type"] = stype
+
     return data
 
 def format_claim_entry(item: dict) -> tuple[str, str, str]:
     gname = item.get("game") or "未识别游戏"
     name = item.get("name", "未知奖励")
     count = item.get("total_count", 1)
-    count_str = f" (累计已领 {count} 次)" if count > 0 else ""
-    full_name = f"[{gname}] {name}{count_str}"
+    req_min = item.get("required_minutes")
+    dur_str = format_duration(req_min)
+
+    info_parts = []
+    if dur_str:
+        info_parts.append(f"观看{dur_str}")
+    if count and count > 0:
+        info_parts.append(f"累计{count}次")
+
+    tag_str = f"（{'，'.join(info_parts)}）" if info_parts else ""
+    full_name = f"[{gname}] {name} {tag_str}".strip()
 
     raw_t = item.get("raw_time") or item.get("awarded_at", "")
     _, cst_time_str = parse_iso_to_cst(raw_t)
@@ -204,7 +316,7 @@ def render_cli(statuses: list[dict], show_history: bool = False):
         return "\n".join(lines)
 
     for i, s in enumerate(statuses):
-        run_badge = "🟢 运行中" if s["running"] else "🔴 已停止"
+        run_badge = s.get("status_badge") or ("🟢 观看中" if s["running"] else "⚪ 已停止")
         svc_display = f" [{s['service']}]" if s['service'] != "-" else ""
         lines.append(f"│ 👤 {s['name']}{svc_display}  {run_badge}")
         lines.append(f"│   状态: {s['status_text']}")
@@ -213,7 +325,7 @@ def render_cli(statuses: list[dict], show_history: bool = False):
         games_str = ", ".join(games) if games else "未配置(全部游戏)"
         mode_str = s.get("priority_mode") or "默认模式"
         lines.append(f"│   🎯 跟踪游戏: {games_str}")
-        lines.append(f"│   ⚙️ 挂机模式: {mode_str}")
+        lines.append(f"│   ⚙️  挂机模式: {mode_str}")
 
         watching = s.get("watching")
         if watching:
@@ -247,7 +359,7 @@ def render_cli(statuses: list[dict], show_history: bool = False):
                 _, full_name, time_display = format_claim_entry(item)
                 lines.append(f"│      • [{time_display}] {full_name}")
 
-        lines.append(f"│   ⏱️ 状态同步: {s['updated_at']} (UTC+8)")
+        lines.append(f"│   ⏱️  状态同步: {s['updated_at']} (UTC+8)")
 
         if i < len(statuses) - 1:
             lines.append(f"├{sep}┤")
